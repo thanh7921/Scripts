@@ -681,22 +681,34 @@ class SysUpdater:
         self._instantiate_tasks()
         self._apply_profile()  # Apply profile flags
 
-        # --- 1. Run Preliminary Task (as part of Sequential) ---
+        # --- 1. Build Task Lists ---
         prelim_task = self.task_map["prelim"]
-
         sequential_tasks, parallel_tasks, check_tasks = self._build_task_lists()
 
-        # Add prelim_task to the front of the sequential list
-        sequential_tasks.insert(0, prelim_task)
-        self.all_tasks_run.append(prelim_task)  # Add to summary list
+        # Add prelim_task to summary list, but it will be run separately.
+        self.all_tasks_run.append(prelim_task)
 
         if not sequential_tasks and not parallel_tasks and not check_tasks:
             self.logger.info("No update tasks selected. See --help for options.")
             return 0
 
-        # --- 2. Run Sequential Update Tasks ---
+        # --- 2. Run Preliminary Task (Interactively) ---
+        # This is run *outside* of any Progress context to allow
+        # sudo -v to prompt for a password if needed.
+        self._print_section_header("Running Preliminary Check")
+        try:
+            prelim_task.run()
+        except Exception as e:
+            self.logger.critical(f"CRITICAL FAILURE in {prelim_task.name} task: {e}")
+            prelim_task.status = STATUS_EXCEPTION
+
+        if prelim_task.status != 0:
+            self.logger.error("Sudo check failed. Aborting further tasks.")
+            return prelim_task.status
+
+        # --- 3. Run Sequential Update Tasks ---
         if sequential_tasks:
-            self._print_section_header("Running Sequential Updates & Checks")
+            self._print_section_header("Running Sequential Updates")
             with Progress(
                 SpinnerColumn(),
                 TextColumn("[progress.description]{task.description}"),
