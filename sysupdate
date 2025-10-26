@@ -1,0 +1,934 @@
+#!/usr/bin/env python3
+
+import sys
+import os
+import argparse
+import shutil
+import time
+import logging
+import logging.handlers
+from pathlib import Path
+from abc import ABC, abstractmethod
+from subprocess import CompletedProcess, Popen, PIPE
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# --- Dependency Check ---
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.logging import RichHandler
+    from rich.progress import Progress, SpinnerColumn, TextColumn
+    from rich.table import Table
+except ImportError:
+    print(
+        "Error: The 'rich' library is required. Please install it using:",
+        file=sys.stderr,
+    )
+    print("\n  pip install rich\n", file=sys.stderr)
+    sys.exit(1)
+
+# --- Configuration ---
+HOME = Path.home()
+NORDIC_THEME_DIR = HOME / ".local/share/themes/Nordic"
+GITCLONE_BASE_DIR = HOME / "GitClone"
+ESP_IDF_DIR = GITCLONE_BASE_DIR / "esp-idf"
+KEYD_DIR = GITCLONE_BASE_DIR / "keyd"
+OH_MY_TMUX_DIR = GITCLONE_BASE_DIR / "oh-my-tmux"
+
+# --- Status Constants ---
+STATUS_OK = 0
+STATUS_NOT_RUN = -1
+STATUS_CMD_NOT_FOUND = 250
+STATUS_ERROR = 1  # Generic error
+STATUS_EXCEPTION = -999  # Internal exception during command execution
+
+
+# =============================================================================
+# --- Base Class for Update Tasks ---
+# =============================================================================
+
+
+class UpdateTask(ABC):
+    """
+    Abstract Base Class for all update tasks.
+
+    Provides a unified API for execution, logging, and status reporting.
+    Relies on rich.logging.RichHandler for all console output.
+    """
+
+    def __init__(self, logger, verbose):
+        self.logger = logger  # Root logger
+        self.verbose = verbose
+        self.status = STATUS_NOT_RUN
+        self.name = self.__class__.__name__.replace("Task", "")
+        self.task_logger = logging.getLogger(self.name)  # Sub-logger
+        self.progress = None
+        self.task_id = None
+
+    @abstractmethod
+    def run(self):
+        """
+        The main execution method for the task.
+        This must be implemented by all subclasses and set self.status.
+        It should call _start_progress() and _stop_progress().
+        """
+        pass
+
+    def set_progress(self, progress, task_id):
+        """
+        Assigns a rich.progress.Progress object and task_id to this task
+        for UI updates during parallel execution.
+        """
+        self.progress = progress
+        self.task_id = task_id
+
+    def _start_progress(self):
+        """Updates the Progress UI to show this task is running."""
+        if self.progress:
+            self.progress.start_task(self.task_id)
+            self.progress.update(self.task_id, description=f"Running: {self.name}")
+
+    def _stop_progress(self, status_msg=None):
+        """
+        Updates the Progress UI to show this task is finished.
+        Uses status_msg if provided, otherwise infers from self.status.
+        """
+        if self.progress:
+            if status_msg:
+                final_desc = f"{status_msg}: {self.name}"
+            else:
+                # Default status messages
+                status_map = {
+                    STATUS_OK: "✅ Done",
+                    STATUS_CMD_NOT_FOUND: "⚠️ Skipped",
+                }
+                status_text = status_map.get(self.status, "❌ Failed")
+                final_desc = f"{status_text}: {self.name}"
+
+            self.progress.update(self.task_id, description=final_desc, completed=True)
+
+    # --- Command Execution Helper ---
+
+    def _run_shell_command(self, cmd_str, command_desc, cwd=None, success_codes=None):
+        """
+        Runs a command using the system shell.
+        - Streams output to a sub-logger.
+        - The RichHandler attached to the root logger decides
+          whether to print this to console (based on verbosity).
+        - success_codes: A list of exit codes to treat as success.
+          Defaults to [0] if None.
+        Returns a CompletedProcess object.
+        """
+        if success_codes is None:
+            success_codes = [0]
+
+        self.task_logger.info(f"--- Running: {cmd_str} (in {cwd or os.getcwd()}) ---")
+
+        stdout_lines = []
+        stderr_lines = []
+        return_code = 0
+
+        try:
+            process = Popen(
+                cmd_str,
+                shell=True,
+                executable="/bin/bash",
+                stdout=PIPE,
+                stderr=PIPE,
+                text=True,
+                cwd=cwd,
+                bufsize=1,  # Line-buffered
+                encoding="utf-8",
+                errors="replace",
+            )
+
+            if process.stdout:
+                for line in process.stdout:
+                    stdout_lines.append(line)
+                    line_no_newline = line.rstrip()
+                    self.task_logger.info(line_no_newline)
+
+            if process.stderr:
+                for line in process.stderr:
+                    stderr_lines.append(line)
+                    line_no_newline = line.rstrip()
+                    self.task_logger.warning(line_no_newline)
+
+            process.wait()
+            return_code = process.returncode
+
+        except Exception as e:
+            self.task_logger.error(f"Exception running command '{cmd_str}': {e}")
+            stderr_lines.append(str(e))
+            return_code = STATUS_EXCEPTION
+
+        is_success = return_code in success_codes
+
+        if is_success:
+            self.task_logger.info(
+                f"--- Finished: {command_desc} (Code {return_code}) ---"
+            )
+        else:
+            self.task_logger.error(
+                f"--- Failed: {command_desc} (Code {return_code}) ---"
+            )
+
+        # In non-verbose mode, dump output to console *only* if the command failed
+        if not self.verbose and not is_success:
+            self.task_logger.error("--- Command Output (on failure): ---")
+            self.task_logger.error("STDOUT:\n" + "".join(stdout_lines))
+            self.task_logger.error("STDERR:\n" + "".join(stderr_lines))
+            self.task_logger.error("--- End of Output ---")
+
+        return CompletedProcess(
+            args=cmd_str,
+            returncode=return_code,
+            stdout="".join(stdout_lines),
+            stderr="".join(stderr_lines),
+        )
+
+    def _run_git_task(self, title, path, cmd_str, desc):
+        """
+        Helper to run a git command in a specific directory.
+        Returns the exit code.
+        """
+        if not path.is_dir():
+            self.task_logger.warning(
+                f"{title}: Directory not found at '{path}'. Skipping."
+            )
+            return STATUS_ERROR
+
+        self.task_logger.info(f"Running task for: {title} ({path})")
+        result = self._run_shell_command(
+            cmd_str, f"{desc} ({title} in {path})", cwd=path
+        )
+        return result.returncode
+
+
+# =============================================================================
+# --- Derived Update Task Classes ---
+# =============================================================================
+
+
+class PreliminaryTask(UpdateTask):
+    """Task for preliminary checks, like sudo -v."""
+
+    def run(self):
+        self._start_progress()
+        try:
+            result = self._run_shell_command(
+                "sudo -v", "sudo credential check (sudo -v)"
+            )
+            if result.returncode != 0:
+                self.task_logger.warning(
+                    "Sudo credentials not active. Subsequent tasks may fail or prompt if needed."
+                )
+            self.status = result.returncode
+        except Exception as e:
+            self.task_logger.error(f"Critical exception in run: {e}")
+            self.status = STATUS_EXCEPTION
+        finally:
+            self._stop_progress()
+        return self.status
+
+
+class AptUpdateTask(UpdateTask):
+    """Task for handling APT updates and upgrades with retry logic."""
+
+    MAX_RETRIES = 3
+    RETRY_DELAY_SEC = 10
+    LOCK_ERROR_STRINGS = [
+        "could not get lock",
+        "unable to acquire the dpkg frontend lock",
+        "unable to lock the administration directory",
+        "waiting for cache lock",
+        "apt-get is running",
+    ]
+
+    def run(self):
+        self._start_progress()
+        try:
+            cmd_str = "sudo NEEDRESTART_SUSPEND=1 DEBIAN_FRONTEND=noninteractive apt update && sudo NEEDRESTART_SUSPEND=1 DEBIAN_FRONTEND=noninteractive apt upgrade -y"
+            desc = "sudo apt update && sudo apt upgrade -y"
+
+            retries = 0
+            while retries <= self.MAX_RETRIES:
+                result = self._run_shell_command(cmd_str, desc)
+
+                if result.returncode == 0:
+                    self.status = STATUS_OK
+                    break  # Success
+
+                stderr_lower = result.stderr.lower()
+                is_lock_error = any(s in stderr_lower for s in self.LOCK_ERROR_STRINGS)
+
+                if is_lock_error and retries < self.MAX_RETRIES:
+                    retries += 1
+                    self.task_logger.warning(
+                        f"APT lock file detected. Waiting {self.RETRY_DELAY_SEC}s... (Attempt {retries}/{self.MAX_RETRIES})"
+                    )
+                    time.sleep(self.RETRY_DELAY_SEC)
+                else:
+                    if is_lock_error:
+                        self.task_logger.error(
+                            f"APT lock file still present after {self.MAX_RETRIES} attempts. Aborting task."
+                        )
+                    else:
+                        self.task_logger.error(
+                            "APT command failed with a non-lock error. See output."
+                        )
+                    self.status = result.returncode
+                    break  # Final failure
+            else:
+                # This block runs if the while loop completes without break (shouldn't happen)
+                self.status = STATUS_ERROR
+
+        except Exception as e:
+            self.task_logger.error(f"Critical exception in run: {e}")
+            self.status = STATUS_EXCEPTION
+        finally:
+            self._stop_progress()
+        return self.status
+
+
+class FlatpakUpdateTask(UpdateTask):
+    """Task for handling Flatpak updates."""
+
+    def run(self):
+        self._start_progress()
+        try:
+            result = self._run_shell_command("flatpak update -y", "flatpak update -y")
+            self.status = result.returncode
+        except Exception as e:
+            self.task_logger.error(f"Critical exception in run: {e}")
+            self.status = STATUS_EXCEPTION
+        finally:
+            self._stop_progress()
+        return self.status
+
+
+class PipxUpdateTask(UpdateTask):
+    """Task for handling pipx package upgrades."""
+
+    def run(self):
+        self._start_progress()
+        try:
+            result = self._run_shell_command("pipx upgrade-all", "pipx upgrade-all")
+            self.status = result.returncode
+        except Exception as e:
+            self.task_logger.error(f"Critical exception in run: {e}")
+            self.status = STATUS_EXCEPTION
+        finally:
+            self._stop_progress()
+        return self.status
+
+
+class RustupUpdateTask(UpdateTask):
+    """Task for handling rustup updates."""
+
+    def run(self):
+        self._start_progress()
+        try:
+            result = self._run_shell_command("rustup update", "rustup update")
+            self.status = result.returncode
+        except Exception as e:
+            self.task_logger.error(f"Critical exception in run: {e}")
+            self.status = STATUS_EXCEPTION
+        finally:
+            self._stop_progress()
+        return self.status
+
+
+class GitUpdateTask(UpdateTask):
+    """Task for updating all configured Git repositories."""
+
+    def run(self):
+        self._start_progress()
+        try:
+            if not GITCLONE_BASE_DIR.is_dir():
+                self.task_logger.warning(
+                    f"GitClone base directory not found at '{GITCLONE_BASE_DIR}'. Skipping GitClone sub-directory updates."
+                )
+                self.status = STATUS_ERROR
+                return self.status
+
+            statuses = []
+            statuses.append(
+                self._run_git_task(
+                    "Nordic Theme Update", NORDIC_THEME_DIR, "git pull", "git pull"
+                )
+            )
+            statuses.append(
+                self._run_git_task(
+                    "ESP-IDF Update",
+                    ESP_IDF_DIR,
+                    "git checkout master && git pull && git submodule update --init --recursive",
+                    "git ops",
+                )
+            )
+            statuses.append(
+                self._run_git_task("Keyd Fetch", KEYD_DIR, "git fetch", "git fetch")
+            )
+            statuses.append(
+                self._run_git_task(
+                    "Oh My Tmux Update",
+                    OH_MY_TMUX_DIR,
+                    "git pull",
+                    "git pull",
+                )
+            )
+
+            if all(s == 0 for s in statuses):
+                self.status = STATUS_OK
+            else:
+                self.status = STATUS_ERROR
+
+        except Exception as e:
+            self.task_logger.error(f"Critical exception in run: {e}")
+            self.status = STATUS_EXCEPTION
+        finally:
+            self._stop_progress()
+        return self.status
+
+
+class FwupdTask(UpdateTask):
+    """Task for checking firmware updates (notify only)."""
+
+    def __init__(self, logger, verbose):
+        super().__init__(logger, verbose)
+        self.updates_found = False
+        self.special_status_msg = None
+
+    def run(self):
+        self._start_progress()
+        try:
+            if not shutil.which("fwupdmgr"):
+                self.task_logger.warning(
+                    "'fwupdmgr' command not found. Skipping this scan."
+                )
+                self.status = STATUS_CMD_NOT_FOUND
+                return self.status
+
+            refresh_result = self._run_shell_command(
+                "fwupdmgr refresh --force", "fwupdmgr refresh --force"
+            )
+
+            if refresh_result.returncode != 0:
+                self.task_logger.error(
+                    "fwupdmgr: Refresh failed. Skipping get-updates."
+                )
+                self.status = refresh_result.returncode
+                return self.status
+
+            result = self._run_shell_command(
+                "fwupdmgr get-updates",
+                "fwupdmgr get-updates",
+                success_codes=[0, 2],  # Treat 0 and 2 as success
+            )
+            return_code = result.returncode
+            full_output_lower = (result.stdout + result.stderr).lower()
+            has_no_updates = "no updates available" in full_output_lower
+
+            if return_code == 0:
+                if has_no_updates:
+                    self.task_logger.info("fwupdmgr: No updates available.")
+                    self.special_status_msg = "✅ No Updates"
+                else:
+                    self.task_logger.warning("fwupdmgr: Updates found.")
+                    self.updates_found = True
+                    self.special_status_msg = "⚠️ Updates Found"
+                self.status = STATUS_OK
+
+            elif return_code == 2:
+                # Special case: fwupdmgr exits 2 for "no updates"
+                if has_no_updates:
+                    self.task_logger.info(
+                        f"fwupdmgr: No updates available (exit code {return_code} interpreted as success)."
+                    )
+                    self.special_status_msg = "✅ No Updates"
+                else:
+                    self.task_logger.warning(
+                        f"fwupdmgr: Updates found (exit code {return_code} interpreted as success)."
+                    )
+                    self.updates_found = True
+                    self.special_status_msg = "⚠️ Updates Found"
+                self.status = STATUS_OK
+
+            else:
+                self.task_logger.error(
+                    f"fwupdmgr: Scan failed with unexpected exit code {return_code}."
+                )
+                self.status = return_code
+
+        except Exception as e:
+            self.task_logger.error(f"Critical exception in run: {e}")
+            self.status = STATUS_EXCEPTION
+        finally:
+            self._stop_progress(status_msg=self.special_status_msg)
+        return self.status
+
+
+class NeedRestartTask(UpdateTask):
+    """Task for running the 'needrestart' scan."""
+
+    def run(self):
+        self._start_progress()
+        try:
+            result = self._run_shell_command(
+                "sudo needrestart -p", "sudo needrestart -p"
+            )
+            self.status = result.returncode
+        except Exception as e:
+            self.task_logger.error(f"Critical exception in run: {e}")
+            self.status = STATUS_EXCEPTION
+        finally:
+            self._stop_progress()
+        return self.status
+
+
+class CheckRestartTask(UpdateTask):
+    """Task for running the 'checkrestart' scan."""
+
+    def run(self):
+        self._start_progress()
+        try:
+            if not shutil.which("checkrestart"):
+                self.task_logger.warning(
+                    "'checkrestart' command not found. Skipping this scan. "
+                    "Consider 'sudo apt install debian-goodies'"
+                )
+                self.status = STATUS_CMD_NOT_FOUND
+                return self.status
+
+            result = self._run_shell_command("sudo checkrestart", "sudo checkrestart")
+            self.status = result.returncode
+        except Exception as e:
+            self.task_logger.error(f"Critical exception in run: {e}")
+            self.status = STATUS_EXCEPTION
+        finally:
+            self._stop_progress()
+        return self.status
+
+
+# =============================================================================
+# --- Main Orchestrator Class ---
+# =============================================================================
+
+
+class SysUpdater:
+    """
+    Main orchestrator for system updates.
+
+    Parses arguments, instantiates the required update tasks,
+    and runs them using a rich-based logging and progress UI.
+    """
+
+    PROFILES = {
+        "minimal": ["apt", "restart_checks"],
+        "default": ["apt", "flatpak", "pipx", "rustup", "restart_checks"],
+        "full": [
+            "apt",
+            "flatpak",
+            "pipx",
+            "rustup",
+            "git",
+            "fwupd",
+            "restart_checks",
+        ],
+    }
+
+    def __init__(self, args):
+        self.console = Console(highlight=False)
+        self.args = args
+        self.verbose = args.verbose
+        self.logging_enabled = not args.no_log
+        self.logger = logging.getLogger()  # Root logger
+        self.log_handler = None
+        self.rich_handler = None
+        self.task_map = {}
+        self.all_tasks_run = []
+
+        self._setup_logging()
+
+    def _setup_logging(self):
+        """Configures file and rich console logging."""
+        self.logger.setLevel(logging.INFO)  # Capture all levels
+
+        if self.logging_enabled:
+            try:
+                cache_base = Path(
+                    os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")
+                )
+                log_dir = cache_base / "sysupdate"
+                log_dir.mkdir(parents=True, exist_ok=True)
+                log_file = log_dir / "sysupdate.log"
+
+                self.log_handler = logging.handlers.RotatingFileHandler(
+                    log_file, maxBytes=200 * 1024, backupCount=5
+                )
+                formatter = logging.Formatter("%(asctime)s - %(name)s - %(message)s")
+                self.log_handler.setFormatter(formatter)
+                self.log_handler.setLevel(logging.INFO)  # Log everything to file
+                self.logger.addHandler(self.log_handler)
+                self.logger.info("--- SysUpdater session started (File Log) ---")
+
+            except Exception as e:
+                self.console.print(
+                    f"[bold red]❌ Failed to initialize file logger:[/bold red] {e}"
+                )
+                self.logging_enabled = False
+                self.log_handler = None
+
+        # Configure RichHandler for console output
+        self.rich_handler = RichHandler(
+            console=self.console,
+            level=logging.INFO if self.verbose else logging.WARNING,
+            show_path=False,
+            show_time=False,
+            show_level=False,
+            markup=True,
+            log_time_format="[%X]",
+        )
+        self.logger.addHandler(self.rich_handler)
+
+    def __del__(self):
+        """Destructor to ensure log handlers are closed."""
+        if self.logger:
+            if self.log_handler:
+                self.logger.info("--- SysUpdater session finished (File Log) ---")
+                self.log_handler.close()
+                self.logger.removeHandler(self.log_handler)
+            if self.rich_handler:
+                self.logger.removeHandler(self.rich_handler)
+
+    def _print_section_header(self, title):
+        """Prints a styled panel header for a section."""
+        self.console.print()
+        self.console.print(
+            Panel(
+                title,
+                style="bold bright_magenta",
+                title_align="left",
+                border_style="bright_magenta",
+            )
+        )
+        self.console.print()
+
+    def _instantiate_tasks(self):
+        """Creates instances of all possible tasks."""
+        self.task_map = {
+            "prelim": PreliminaryTask(self.logger, self.verbose),
+            "apt": AptUpdateTask(self.logger, self.verbose),
+            "flatpak": FlatpakUpdateTask(self.logger, self.verbose),
+            "pipx": PipxUpdateTask(self.logger, self.verbose),
+            "rustup": RustupUpdateTask(self.logger, self.verbose),
+            "git": GitUpdateTask(self.logger, self.verbose),
+            "fwupd": FwupdTask(self.logger, self.verbose),
+            "needrestart": NeedRestartTask(self.logger, self.verbose),
+            "checkrestart": CheckRestartTask(self.logger, self.verbose),
+        }
+
+    def _apply_profile(self):
+        """If a profile is specified, set the corresponding args."""
+        profile_name = self.args.profile
+        if not profile_name:
+            return
+
+        if profile_name not in self.PROFILES:
+            self.logger.warning(
+                f"Profile '{profile_name}' not found. No tasks will be run from profile."
+            )
+            return
+
+        self.logger.info(f"Applying profile: [bold]{profile_name}[/bold]")
+        tasks_to_run = self.PROFILES[profile_name]
+        for task_flag in tasks_to_run:
+            setattr(self.args, task_flag, True)
+
+    def _build_task_lists(self):
+        """Builds the lists of tasks to run based on args."""
+        sequential_update_tasks = []
+        parallel_update_tasks = []
+        check_tasks = []
+
+        # Sequential tasks
+        if self.args.apt:
+            sequential_update_tasks.append(self.task_map["apt"])
+
+        # Parallel-safe tasks
+        if self.args.flatpak:
+            parallel_update_tasks.append(self.task_map["flatpak"])
+        if self.args.pipx:
+            parallel_update_tasks.append(self.task_map["pipx"])
+        if self.args.rustup:
+            parallel_update_tasks.append(self.task_map["rustup"])
+        if self.args.git:
+            parallel_update_tasks.append(self.task_map["git"])
+        if self.args.fwupd:
+            parallel_update_tasks.append(self.task_map["fwupd"])
+
+        # Check tasks (run last)
+        if self.args.restart_checks:
+            check_tasks.append(self.task_map["needrestart"])
+            check_tasks.append(self.task_map["checkrestart"])
+
+        return sequential_update_tasks, parallel_update_tasks, check_tasks
+
+    def run(self):
+        """
+        Main execution flow of the update script.
+        """
+        self._instantiate_tasks()
+        self._apply_profile()  # Apply profile flags
+
+        # --- 1. Run Preliminary Task (as part of Sequential) ---
+        prelim_task = self.task_map["prelim"]
+
+        sequential_tasks, parallel_tasks, check_tasks = self._build_task_lists()
+
+        # Add prelim_task to the front of the sequential list
+        sequential_tasks.insert(0, prelim_task)
+        self.all_tasks_run.append(prelim_task)  # Add to summary list
+
+        if not sequential_tasks and not parallel_tasks and not check_tasks:
+            self.logger.info("No update tasks selected. See --help for options.")
+            return 0
+
+        # --- 2. Run Sequential Update Tasks ---
+        if sequential_tasks:
+            self._print_section_header("Running Sequential Updates & Checks")
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                console=self.console,
+                transient=False,
+            ) as progress:
+                for task in sequential_tasks:
+                    if task not in self.all_tasks_run:
+                        self.all_tasks_run.append(task)
+
+                    task_id = progress.add_task(
+                        description=f"Queued: {task.name}", total=None, start=False
+                    )
+                    task.set_progress(progress, task_id)
+
+                    try:
+                        task.run()
+                    except Exception as e:
+                        self.logger.critical(
+                            f"CRITICAL FAILURE in {task.name} task: {e}"
+                        )
+                        task.status = STATUS_EXCEPTION
+                        task._stop_progress()  # Manually stop progress on exception
+
+                    # Special check for preliminary task failure
+                    if task.name == "Preliminary" and task.status != 0:
+                        self.logger.error("Sudo check failed. Aborting further tasks.")
+                        return task.status
+
+        # --- 3. Run Parallel Tasks ---
+        if parallel_tasks:
+            self._print_section_header("Running Parallel Updates")
+            self.all_tasks_run.extend(parallel_tasks)
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                console=self.console,
+                transient=False,  # Keep final status on screen
+            ) as progress:
+                task_id_map = {}
+                for task in parallel_tasks:
+                    task_id = progress.add_task(
+                        description=f"Queued: {task.name}", total=None, start=False
+                    )
+                    task_id_map[task.name] = task_id
+                    task.set_progress(progress, task_id)
+
+                max_workers = len(parallel_tasks)
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = {
+                        executor.submit(task.run): task for task in parallel_tasks
+                    }
+
+                    for future in as_completed(futures):
+                        task = futures[future]
+                        try:
+                            future.result()
+                        except Exception as e:
+                            self.logger.critical(
+                                f"CRITICAL FAILURE in {task.name} task: {e}"
+                            )
+                            task.status = STATUS_EXCEPTION
+                            # Update progress bar to show failure
+                            task._stop_progress()
+
+        # --- 4. Run Check Tasks Last ---
+        if check_tasks:
+            self._print_section_header("Running Restart/Check Scans")
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                console=self.console,
+                transient=False,
+            ) as progress:
+                for task in check_tasks:
+                    self.all_tasks_run.append(task)
+                    task_id = progress.add_task(
+                        description=f"Queued: {task.name}", total=None, start=False
+                    )
+                    task.set_progress(progress, task_id)
+
+                    try:
+                        task.run()
+                    except Exception as e:
+                        self.logger.critical(
+                            f"CRITICAL FAILURE in {task.name} task: {e}"
+                        )
+                        task.status = STATUS_EXCEPTION
+                        task._stop_progress()  # Manually stop progress on exception
+
+        # --- 5. Print final summary ---
+        self.console.print()
+        summary_table = Table(
+            title="✅ All Tasks Finished. Final Summary:",
+            show_header=True,
+            header_style="bold bright_magenta",
+            title_style="bold bright_green",
+        )
+        summary_table.add_column("Status", style="dim", width=7)
+        summary_table.add_column("Task")
+        summary_table.add_column("Result")
+
+        for task in self.all_tasks_run:
+            task_name = task.name
+            status = task.status
+            result_text = ""
+
+            if status == STATUS_OK:
+                status_icon = "[green]✅[/green]"
+                result_text = "Completed"
+                # --- Special OK cases ---
+                if task_name == "Fwupd":
+                    if task.updates_found:
+                        status_icon = "[yellow]⚠️[/yellow]"
+                        result_text = "[yellow]Updates are available[/yellow]"
+                    else:
+                        result_text = "No updates available"
+                elif task_name == "NeedRestart":
+                    result_text = "Scan complete (No restarts indicated)"
+                elif task_name == "CheckRestart":
+                    result_text = "Scan complete (No outdated processes)"
+
+            elif status == STATUS_NOT_RUN:
+                status_icon = "[dim]⚪️[/dim]"
+                result_text = "Not run"
+            elif status == STATUS_CMD_NOT_FOUND:
+                status_icon = "[yellow]⚠️[/yellow]"
+                result_text = "Command not found (Skipped)"
+            else:  # All other errors
+                status_icon = "[red]❌[/red]"
+                result_text = f"Failed (Code: {status})"
+                # --- Special Error cases ---
+                if task_name == "NeedRestart":
+                    result_text = (
+                        f"[yellow]Pending restarts detected (Code: {status})[/yellow]"
+                    )
+                elif task_name == "CheckRestart":
+                    result_text = (
+                        f"[yellow]Outdated processes found (Code: {status})[/yellow]"
+                    )
+
+            summary_table.add_row(status_icon, task_name, result_text)
+
+        self.console.print(summary_table)
+        self.console.print()
+        return 0
+
+
+def main():
+    """
+    Parses arguments and runs the system updater.
+    """
+    parser = argparse.ArgumentParser(
+        description="A modular system update script with a rich parallel UI.",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+
+    # --- Task Flags ---
+    parser.add_argument(
+        "--apt", action="store_true", help="Run APT update and upgrade."
+    )
+    parser.add_argument("--flatpak", action="store_true", help="Run Flatpak update.")
+    parser.add_argument("--pipx", action="store_true", help="Run pipx upgrade-all.")
+    parser.add_argument("--rustup", action="store_true", help="Run rustup update.")
+    parser.add_argument(
+        "--git", action="store_true", help="Update configured Git repositories."
+    )
+    parser.add_argument(
+        "--restart-checks",
+        action="store_true",
+        help="Run needrestart and checkrestart scans.",
+    )
+    parser.add_argument(
+        "--fwupd",
+        action="store_true",
+        help="Check for firmware updates (notify only).",
+    )
+
+    # --- Profile Flags ---
+    parser.add_argument(
+        "-p",
+        "--profile",
+        type=str,
+        choices=["minimal", "default", "full"],
+        help="Run a predefined profile of update tasks:\n"
+        "  minimal: apt, restart-checks\n"
+        "  default: apt, flatpak, pipx, rustup, restart-checks\n"
+        "  full:    all update tasks, restart-checks",
+    )
+
+    # --- Other Flags ---
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Stream full command output to the console (sets log level to INFO).",
+    )
+    parser.add_argument(
+        "--no-log",
+        action="store_true",
+        help="Disable writing a log file to $XDG_CACHE_HOME/sysupdate/.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version="sysupdate v3.0 (rich parallel UI)",
+        help="Show script version and exit",
+    )
+
+    # --- Behavior Change: Print help if no args ---
+    if len(sys.argv) == 1:
+        parser.print_help()
+        sys.exit(0)
+
+    args = parser.parse_args()
+
+    updater = None
+    try:
+        updater = SysUpdater(args)
+        sys.exit(updater.run())
+    except KeyboardInterrupt:
+        if updater:
+            updater.console.print(
+                "\n[bold red]❌ Update interrupted by user.[/bold red]"
+            )
+            if updater.logger:
+                updater.logger.warning("--- SysUpdater interrupted by user ---")
+        else:
+            print("\n❌ Update interrupted by user.", file=sys.stderr)
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()
